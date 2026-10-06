@@ -20,3 +20,7 @@ zig-pkg/
 .sisyphus/
 .sisyphus.json
 analysis_report/
+
+# local runtime state (setup-8300.sh)
+proxy-8300.log
+proxy-8300.pid

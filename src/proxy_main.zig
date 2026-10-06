@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const proxy = @import("proxy");
 const tui = @import("tui");
+const hot_reload = @import("hot_reload");
 
 pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -9,13 +10,18 @@ pub fn main(init: std.process.Init) !void {
     const allocator = gpa.allocator();
     const io = init.io;
 
-    // Parse --tui flag
+    // Parse --tui flag, --port=<n> (default 4000), and --aliases=<path>
     var use_tui = false;
+    var listen_port: u16 = 4000;
+    var aliases_path: ?[]const u8 = null;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--tui")) {
             use_tui = true;
-            break;
+        } else if (std.mem.startsWith(u8, arg, "--port=")) {
+            listen_port = std.fmt.parseInt(u16, arg[7..], 10) catch 4000;
+        } else if (std.mem.startsWith(u8, arg, "--aliases=")) {
+            aliases_path = arg[10..];
         }
     }
 
@@ -47,8 +53,25 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("Cache: disabled (set via config)", .{});
     std.log.info("KV Backend: memory (in-memory, zero dependency)", .{});
 
-    const port = 4000;
-    var server = try proxy.Server.init(
+    const port: u16 = listen_port;
+
+    // Edge config: env-var-driven base-URL overrides for local backends
+    // (cross-test setup 2026-10-03). Slot mapping (all OpenAI-format passthrough):
+    //   openai    <- LLMLITE_OPENAI_BASE_URL    (q38fn world A head, 172.30.30.25:8010)
+    //   deepseek  <- LLMLITE_DEEPSEEK_BASE_URL  (q38fn world B head, 172.30.30.27:8010)
+    //   moonshot  <- LLMLITE_MOONSHOT_BASE_URL  (glm53 world head,   172.30.30.29:8010)
+    //   minimax   <- LLMLITE_MINIMAX_BASE_URL   (kyber 27b vLLM,     172.30.30.20:8000)
+    // Per-slot API keys via OPENAI_API_KEY / DEEPSEEK_API_KEY / MOONSHOT_API_KEY / MINIMAX_API_KEY.
+    // Unprefixed model requests route to the openai slot (deterministic; latency tracking off).
+    var edge_config = hot_reload.getDefaultEdgeConfig();
+    if (std.c.getenv("LLMLITE_OPENAI_BASE_URL")) |c| edge_config.openai_base_url = std.mem.span(c);
+    if (std.c.getenv("LLMLITE_DEEPSEEK_BASE_URL")) |c| edge_config.deepseek_base_url = std.mem.span(c);
+    if (std.c.getenv("LLMLITE_MOONSHOT_BASE_URL")) |c| edge_config.moonshot_base_url = std.mem.span(c);
+    if (std.c.getenv("LLMLITE_MINIMAX_BASE_URL")) |c| edge_config.minimax_base_url = std.mem.span(c);
+    edge_config.enabled_providers = "openai,deepseek,moonshot,minimax";
+    edge_config.enable_latency_tracking = false;
+
+    var server = try proxy.Server.initWithEdgeConfig(
         allocator,
         io,
         port,
@@ -56,6 +79,8 @@ pub fn main(init: std.process.Init) !void {
         &rate_limiter,
         &request_logger,
         &metrics,
+        edge_config,
+        aliases_path,
     );
     errdefer server.deinit();
 

@@ -31,6 +31,13 @@ fn StringArrayHashMap(comptime V: type) type {
         pub fn values(self: Self) []V { return self.unmanaged.values(); }
     };
 }
+
+/// Model alias entry: exact request model name -> (provider, target model).
+/// `model` points into the server's aliases_content buffer (valid for process life).
+const Alias = struct {
+    provider: types.ProviderType,
+    model: []const u8,
+};
 const virtual_key = @import("virtual_key");
 const rate_limit = @import("proxy_rate_limit");
 const logger = @import("proxy_logger");
@@ -277,6 +284,8 @@ pub const Server = struct {
     circuit_breaker: circuit_breaker.CircuitBreaker,
     hot_reload: ?*hot_reload.HotReloadConfig,
     edge_config: hot_reload.EdgeRouterConfig,
+    aliases: StringArrayHashMap(Alias),
+    aliases_content: ?[]u8 = null,
 
     // Analytics components
     tracking_store: tracking_analytics.TrackingStore,
@@ -304,7 +313,7 @@ pub const Server = struct {
         request_logger: *logger.RequestLogger,
         metrics: *logger.MetricsCollector,
     ) !Server {
-        return Server.initWithEdgeConfig(allocator, io, port, key_store, rate_limiter, request_logger, metrics, hot_reload.getDefaultEdgeConfig());
+        return Server.initWithEdgeConfig(allocator, io, port, key_store, rate_limiter, request_logger, metrics, hot_reload.getDefaultEdgeConfig(), null);
     }
 
     pub fn initWithEdgeConfig(
@@ -316,6 +325,7 @@ pub const Server = struct {
         request_logger: *logger.RequestLogger,
         metrics: *logger.MetricsCollector,
         edge_config: hot_reload.EdgeRouterConfig,
+        alias_path: ?[]const u8,
     ) !Server {
         var server = Server{
             .allocator = allocator,
@@ -332,6 +342,8 @@ pub const Server = struct {
             .circuit_breaker = undefined,
             .hot_reload = null,
             .edge_config = edge_config,
+            .aliases = StringArrayHashMap(Alias).init(allocator),
+            .aliases_content = null,
             .tracking_store = undefined,
             .tracking_handler = undefined,
             .savings_store = undefined,
@@ -344,6 +356,14 @@ pub const Server = struct {
         // Initialize provider store and handler
         server.provider_store = ProviderStore.init(allocator);
         server.provider_handler = ProviderHandler.init(allocator, &server.provider_store);
+
+        // Load model aliases (exact model name -> provider/model rewrite)
+        if (alias_path) |ap| {
+            server.loadAliases(ap) catch |err| {
+                std.log.err("aliases: failed to load {s}: {}", .{ ap, err });
+            };
+            std.log.info("aliases: {d} alias(es) loaded from {s}", .{ server.aliases.count(), ap });
+        }
 
         // Initialize latency tracker
         server.latency_tracker = latency_health.LatencyTracker.init(
@@ -439,6 +459,11 @@ pub const Server = struct {
         if (self.hot_reload) |hr| {
             hr.deinit();
             self.allocator.destroy(hr);
+        }
+        // Free alias table (keys) and the config buffer the alias models point into
+        self.aliases.deinit();
+        if (self.aliases_content) |c| {
+            self.allocator.free(c);
         }
         if (self.edge_config.enabled_providers) |ep| {
             self.allocator.free(ep);
@@ -1110,6 +1135,49 @@ pub const Server = struct {
         return request_text[auth_start.? .. auth_start.? + auth_end.?];
     }
 
+    /// Load model aliases from a flat key=value file ('#' comments; INI-friendly).
+    /// Each line: `alias = provider/model` (same target syntax as a prefixed model).
+    /// The parsed buffer is kept alive on the server; alias model strings point into it.
+    fn loadAliases(self: *Server, path: []const u8) !void {
+        const file = if (std.fs.path.isAbsolute(path))
+            try std.Io.Dir.openFileAbsolute(self.io, path, .{})
+        else
+            try std.Io.Dir.cwd().openFile(self.io, path, .{});
+        defer file.close(self.io);
+
+        var reader_buffer: [8192]u8 = undefined;
+        var file_reader = file.reader(self.io, &reader_buffer);
+        const content = try file_reader.interface.allocRemaining(self.allocator, .limited(65536));
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse {
+                std.log.warn("aliases: skipping malformed line: '{s}'", .{line});
+                continue;
+            };
+            const alias = std.mem.trim(u8, line[0..eq], " \t");
+            const target = std.mem.trim(u8, line[eq + 1 ..], " \t");
+            const slash = std.mem.indexOfScalar(u8, target, '/') orelse {
+                std.log.warn("aliases: target must be 'provider/model': '{s}'", .{target});
+                continue;
+            };
+            const provider = types.ProviderType.fromString(target[0..slash]) orelse {
+                std.log.warn("aliases: unsupported provider '{s}'", .{target[0..slash]});
+                continue;
+            };
+            const model = std.mem.trim(u8, target[slash + 1 ..], " \t");
+            if (self.aliases.get(alias) != null) {
+                std.log.warn("aliases: duplicate alias '{s}', keeping first", .{alias});
+                continue;
+            }
+            try self.aliases.put(alias, .{ .provider = provider, .model = model });
+            std.log.info("aliases: '{s}' -> {s}/{s}", .{ alias, target[0..slash], model });
+        }
+        self.aliases_content = content;
+    }
+
     const Route = struct {
         provider: types.ProviderType,
         model: []const u8,
@@ -1118,6 +1186,11 @@ pub const Server = struct {
     fn routeChatRequest(self: *Server, body: []const u8) Route {
         // Extract model from request body
         const model = self.extractModelFromBody(body) catch "gpt-4o";
+
+        // Alias lookup first: exact model name -> (provider, target model)
+        if (self.aliases.get(model)) |a| {
+            return .{ .provider = a.provider, .model = a.model };
+        }
 
         // Check if model has provider prefix (e.g., "openai/gpt-4o")
         if (std.mem.find(u8, model, "/")) |idx| {
