@@ -37,16 +37,23 @@ pub const RateLimiter = struct {
     pub fn check(self: *RateLimiter, io: std.Io, key: []const u8, limit: u32) !bool {
         const now = time_compat.timestamp(io);
 
-        const window = try self.windows.getOrPut(self.allocator, key);
-        if (!window.found_existing) {
-            window.value_ptr.* = .{
+        // The map owns its keys - deinit() frees them - so it must be given its own copy. This
+        // used to pass `key` straight to getOrPut, which stored the caller's slice: a pointer into
+        // the connection's request buffer. After that buffer was released the map held a dead key,
+        // and the next getOrPut hashed it and segfaulted (Debug build: segfault inside
+        // array_hash_map.getOrPutContext from rate_limit.zig:40, on the second request through a
+        // freshly started proxy). Insert only when absent so an existing key is never replaced and
+        // its allocation never leaked.
+        if (self.windows.get(key) == null) {
+            const owned_key = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(owned_key);
+            try self.windows.put(self.allocator, owned_key, .{
                 .hits = .empty,
                 .window_start = now,
                 .limit = limit,
-            };
+            });
         }
-
-        const rate_window = window.value_ptr;
+        const rate_window = self.windows.getPtr(key) orelse return error.OutOfMemory;
 
         // Clean up old hits outside 1-second window
         var i: usize = 0;

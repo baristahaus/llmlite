@@ -287,6 +287,17 @@ pub const Server = struct {
     aliases: StringArrayHashMap(Alias),
     aliases_content: ?[]u8 = null,
 
+    /// Hard ceiling on one request (headers + body), in bytes. Set from
+    /// LLMLITE_MAX_REQUEST_BYTES; default 64 MiB, which is room for a 500k-token prompt plus
+    /// base64 image attachments. Requests over the ceiling are refused with 413, never truncated.
+    max_request_bytes: usize = 64 * 1024 * 1024,
+
+    /// Whether the circuit breaker may fail a provider open at all. LLMLITE_CIRCUIT_BREAKER=0 turns
+    /// it off. With a single deployment per provider, an open breaker turns one bad request into a
+    /// recovery-time outage for the only endpoint that exists, and the client cannot tell that
+    /// apart from an upstream that is down.
+    circuit_breaker_enabled: bool = true,
+
     // Analytics components
     tracking_store: tracking_analytics.TrackingStore,
     tracking_handler: tracking_analytics.TrackingHandler,
@@ -388,6 +399,22 @@ pub const Server = struct {
                 .half_open_success_threshold = 2,
             },
         );
+
+        // Operator knobs, both also visible in the startup banner. Defaults preserve upstream
+        // behaviour; our deployment script sets LLMLITE_CIRCUIT_BREAKER=0 because each provider
+        // slot here is exactly one backend.
+        if (std.c.getenv("LLMLITE_MAX_REQUEST_BYTES")) |c| {
+            server.max_request_bytes = std.fmt.parseInt(usize, std.mem.span(c), 10) catch server.max_request_bytes;
+        }
+        if (std.c.getenv("LLMLITE_CIRCUIT_BREAKER")) |c| {
+            const v: []const u8 = std.mem.span(c);
+            // "0" or "off" disables it; anything else leaves it on.
+            var off = v.len == 1 and v[0] == '0';
+            if (v.len == 3 and v[0] == 'o' and v[1] == 'f' and v[2] == 'f') off = true;
+            server.circuit_breaker_enabled = !off;
+        }
+        const breaker_state: []const u8 = if (server.circuit_breaker_enabled) "on" else "off";
+        std.log.info("request ceiling {d} bytes; circuit breaker {s}", .{ server.max_request_bytes, breaker_state });
 
         // Initialize active health checker if enabled
         if (edge_config.enable_health_checker) {
@@ -747,83 +774,176 @@ pub const Server = struct {
         return .success;
     }
 
-    fn handleConnection(self: *Server, connection: std.Io.net.Stream) !void {
-        defer connection.close(self.io);
-
-        var buf: [16384]u8 = undefined;
-        var total_read: usize = 0;
-
-        // Read the complete HTTP request using poll + posix read (POSIX only)
-        var read_attempts: u8 = 0;
-        const max_read_attempts = 50;
-        const is_windows = comptime builtin.os.tag == .windows;
-        while (total_read < buf.len and read_attempts < max_read_attempts) : (read_attempts += 1) {
-            if (!is_windows) {
-                var pollfd = [_]std.posix.pollfd{.{
-                    .fd = connection.socket.handle,
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                }};
-                const ready = std.posix.poll(&pollfd, 500) catch 0;
-                if (ready == 0) continue;
+    /// Value of a named header from a header block, or null. Case-insensitive on the name,
+    /// tolerant of optional whitespace around the colon. Written because the old code matched fixed
+    /// literal offsets ("content-length: ", "\"model\":\"") and quietly mis-handled any spacing it
+    /// did not predict.
+    fn headerValue(headers: []const u8, name: []const u8) ?[]const u8 {
+        var it = std.mem.splitSequence(u8, headers, "\r\n");
+        while (it.next()) |line| {
+            if (line.len > name.len and std.ascii.eqlIgnoreCase(line[0..name.len], name)) {
+                var i = name.len;
+                while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+                if (i < line.len and line[i] == ':') {
+                    i += 1;
+                    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
+                    return line[i..];
+                }
             }
+        }
+        return null;
+    }
 
-            const bytes_read = if (is_windows)
-                self.streamRead(connection, buf[total_read..]) catch |err| {
-                    std.log.warn("stream read error: {}", .{err});
-                    break;
-                }
-            else
-                std.posix.read(connection.socket.handle, buf[total_read..]) catch |err| {
-                    std.log.warn("posix read error: {}", .{err});
-                    break;
-                };
-            if (bytes_read == 0) break;
-            total_read += bytes_read;
+    /// Case-insensitive "chunked" anywhere in a Transfer-Encoding value.
+    fn containsChunked(value: []const u8) bool {
+        const want = "chunked";
+        if (value.len < want.len) return false;
+        var i: usize = 0;
+        while (i + want.len <= value.len) {
+            if (std.ascii.eqlIgnoreCase(value[i .. i + want.len], want)) return true;
+            i += 1;
+        }
+        return false;
+    }
 
-            if (std.mem.find(u8, buf[0..total_read], "\r\n\r\n")) |header_end| {
-                const content_length_prefix = "Content-Length: ";
-                if (std.mem.find(u8, buf[0..header_end], content_length_prefix)) |cl_start| {
-                    const cl_value_start = cl_start + content_length_prefix.len;
-                    const cl_end = std.mem.find(u8, buf[cl_value_start..header_end], "\r\n") orelse continue;
-                    const cl_str = buf[cl_value_start..cl_value_start + cl_end];
-                    const content_length = std.fmt.parseInt(usize, cl_str, 10) catch continue;
-                    const body_start = header_end + 4;
-                    const expected_total = body_start + content_length;
-                    if (total_read < expected_total and expected_total <= buf.len) {
-                        var body_attempts: u8 = 0;
-                        while (total_read < expected_total and body_attempts < max_read_attempts) : (body_attempts += 1) {
-                            if (!is_windows) {
-                                var body_pollfd = [_]std.posix.pollfd{.{
-                                    .fd = connection.socket.handle,
-                                    .events = std.posix.POLL.IN,
-                                    .revents = 0,
-                                }};
-                                const body_ready = std.posix.poll(&body_pollfd, 500) catch 0;
-                                if (body_ready == 0) continue;
-                            }
-                            const body_n = if (is_windows)
-                                self.streamRead(connection, buf[total_read..expected_total]) catch |err| {
-                                    std.log.warn("posix body read error: {}", .{err});
-                                    break;
-                                }
-                            else
-                                std.posix.read(connection.socket.handle, buf[total_read..expected_total]) catch |err| {
-                                    std.log.warn("posix body read error: {}", .{err});
-                                    break;
-                                };
-                            if (body_n == 0) break;
-                            total_read += body_n;
-                        }
-                    }
-                }
+    /// Case-insensitive Content-Length from a header block (kept as the public entry point).
+    fn contentLengthOf(headers: []const u8) ?usize {
+        const v = headerValue(headers, "content-length") orelse return null;
+        return std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch null;
+    }
+
+    /// True if the client used Transfer-Encoding: chunked. There is no length to size a buffer
+    /// from on such a request, so it is refused with 411 rather than read partially and forwarded.
+    fn headerHasChunked(headers: []const u8) bool {
+        const v = headerValue(headers, "transfer-encoding") orelse return false;
+        return containsChunked(v);
+    }
+
+    /// One poll + read. null = poll timed out (no data this instant); 0 = peer closed; n > 0 = data.
+    fn readSome(self: *Server, connection: std.Io.net.Stream, dst: []u8) !?usize {
+        if (comptime builtin.os.tag == .windows) {
+            const got = self.streamRead(connection, dst) catch return null;
+            return got;
+        }
+        var pollfd = [_]std.posix.pollfd{.{
+            .fd = connection.socket.handle,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const ready = std.posix.poll(&pollfd, 500) catch 0;
+        if (ready == 0) return null;
+        return std.posix.read(connection.socket.handle, dst) catch 0;
+    }
+
+    /// Read exactly one HTTP request (headers + body) into a heap buffer sized from Content-Length.
+    /// Refuses instead of truncating: 413 oversized, 411 chunked, 400 incomplete.
+    fn readHttpRequest(self: *Server, connection: std.Io.net.Stream) ![]u8 {
+        // quiet_limit counts 500 ms polls that saw NO data, so a body arriving in many socket reads
+        // is not cut short the way the old fixed 50-attempt budget cut it. ~30 s of silence is the
+        // point at which we give the peer up.
+        const quiet_limit: u32 = 60;
+        const head_cap: usize = @min(self.max_request_bytes, 32 * 1024);
+
+        var head = try self.allocator.alloc(u8, head_cap);
+        defer self.allocator.free(head);
+
+        var total: usize = 0;
+        var quiet: u32 = 0;
+        var header_end: ?usize = null;
+        while (total < head.len and quiet < quiet_limit) {
+            const n = try self.readSome(connection, head[total..]);
+            if (n == null) {
+                quiet += 1;
+                continue;
+            }
+            const got = n.?;
+            if (got == 0) break; // peer closed
+            total += got;
+            quiet = 0;
+            if (std.mem.find(u8, head[0..total], "\r\n\r\n")) |he| {
+                header_end = he;
                 break;
             }
         }
+        if (total == 0) return try self.allocator.alloc(u8, 0); // connected and sent nothing: no-op, as before
 
-        if (total_read == 0) return;
+        const he = header_end orelse {
+            std.log.warn("headers never completed ({d} bytes buffered, cap {d})", .{ total, head_cap });
+            return error.HeadersIncomplete;
+        };
+        const headers = head[0..he];
+        if (headerHasChunked(headers)) return error.ChunkedBodyUnsupported;
 
-        const request_text = buf[0..total_read];
+        const body_start = he + 4;
+        const content_length = contentLengthOf(headers);
+        // A POST with no Content-Length and no Transfer-Encoding has no readable body. Forwarding
+        // one anyway sends the backend an empty body, which it reports as a client bug; refuse.
+        const first_line_end = std.mem.indexOfPos(u8, headers, 0, "\r\n") orelse headers.len;
+        const wants_body = std.mem.startsWith(u8, headers[0..first_line_end], "POST ");
+        if (content_length == null and wants_body) {
+            std.log.warn("POST with no Content-Length and no Transfer-Encoding; refusing rather than forwarding an empty body", .{});
+            return error.ChunkedBodyUnsupported;
+        }
+        const want = body_start + (content_length orelse 0);
+        if (want > self.max_request_bytes) {
+            std.log.warn("refusing request: {d} header + {d} body bytes exceeds the {d} byte ceiling", .{
+                body_start, content_length orelse 0, self.max_request_bytes,
+            });
+            return error.OversizedRequest;
+        }
+        if (total >= want) return try self.allocator.dupe(u8, head[0..total]); // whole request already buffered
+
+        var req = try self.allocator.alloc(u8, want);
+        errdefer self.allocator.free(req);
+        @memcpy(req[0..total], head[0..total]);
+
+        quiet = 0;
+        while (total < want and quiet < quiet_limit) {
+            const n = try self.readSome(connection, req[total..want]);
+            if (n == null) {
+                quiet += 1;
+                continue;
+            }
+            const got = n.?;
+            if (got == 0) break; // peer closed mid-body
+            total += got;
+            quiet = 0;
+        }
+        if (total < want) {
+            std.log.warn("peer closed with {d} of {d} request bytes buffered; refusing rather than forwarding a partial body", .{
+                total, want,
+            });
+            return error.IncompleteBody;
+        }
+        return req;
+    }
+
+    fn handleConnection(self: *Server, connection: std.Io.net.Stream) !void {
+        defer connection.close(self.io);
+
+        // Read the complete HTTP request into heap memory sized from Content-Length.
+        //
+        // This used to be a fixed `var buf: [16384]u8` stack buffer with a 50-attempt read budget.
+        // Any request larger than 16 KiB (headers included) was silently truncated and the remnant
+        // forwarded as if complete, so an oversized chat request reached the backend as invalid
+        // JSON (observed live: Content-Length 23497 forwarded as body len 16194, engine answered
+        // 400 json_invalid). Every such 400 counted as a provider failure, and once the circuit
+        // breaker opened, all later requests failed fast - which looked exactly like a dead
+        // upstream to the client. Silent corruption is the one thing a proxy must never do.
+        const request_text = self.readHttpRequest(connection) catch |err| {
+            const status: u16 = switch (err) {
+                error.OversizedRequest => 413,
+                error.ChunkedBodyUnsupported => 411,
+                error.HeadersIncomplete, error.IncompleteBody => 400,
+                else => 500,
+            };
+            std.log.warn("request rejected before routing: {} (HTTP {d})", .{ err, status });
+            try self.writeJsonResponse(connection, status,
+                "{\"error\":{\"message\":\"Request rejected by llmlite-proxy before routing (too large, chunked, or incomplete). See the proxy log.\",\"type\":\"invalid_request_error\"}}");
+            return;
+        };
+        defer self.allocator.free(request_text);
+        if (request_text.len == 0) return;
         std.log.info("request: {s}", .{request_text[0..@min(request_text.len, 200)]});
 
         if (std.mem.startsWith(u8, request_text, "GET /health/live")) {
@@ -938,7 +1058,7 @@ pub const Server = struct {
         const call_start = time_compat.timestamp(self.io);
 
         // Check circuit breaker before making request
-        if (self.circuit_breaker.isOpen(self.io, route.provider)) {
+        if (self.circuit_breaker_enabled and self.circuit_breaker.isOpen(self.io, route.provider)) {
             std.log.warn("circuit breaker open for {s}, failing fast", .{route.provider.toString()});
             const normalized = error_handler.normalizeError(error.ServiceUnavailable, provider_str.*);
             try self.writeError(connection, normalized);
@@ -950,7 +1070,7 @@ pub const Server = struct {
             std.log.warn("provider call failed: {}", .{err});
             // Record failure for health tracking and circuit breaker
             self.health_checker.recordFailure(route.provider);
-            self.circuit_breaker.recordFailure(self.io, route.provider);
+            if (self.circuit_breaker_enabled) self.circuit_breaker.recordFailure(self.io, route.provider);
             const normalized = error_handler.normalizeError(err, provider_str.*);
             try self.writeError(connection, normalized);
             return;
@@ -1044,7 +1164,7 @@ pub const Server = struct {
         const call_start = time_compat.timestamp(self.io);
 
         // Check circuit breaker before making request
-        if (self.circuit_breaker.isOpen(self.io, route.provider)) {
+        if (self.circuit_breaker_enabled and self.circuit_breaker.isOpen(self.io, route.provider)) {
             std.log.warn("circuit breaker open for {s} embeddings, failing fast", .{provider_str orelse "unknown"});
             const normalized = error_handler.normalizeError(error.ServiceUnavailable, provider_str);
             try self.writeError(connection, normalized);
@@ -1056,7 +1176,7 @@ pub const Server = struct {
             std.log.warn("embeddings provider call failed: {}", .{err});
             // Record failure for health tracking and circuit breaker
             self.health_checker.recordFailure(route.provider);
-            self.circuit_breaker.recordFailure(self.io, route.provider);
+            if (self.circuit_breaker_enabled) self.circuit_breaker.recordFailure(self.io, route.provider);
             const normalized = error_handler.normalizeError(err, provider_str);
             try self.writeError(connection, normalized);
             return;
@@ -1137,7 +1257,9 @@ pub const Server = struct {
 
     /// Load model aliases from a flat key=value file ('#' comments; INI-friendly).
     /// Each line: `alias = provider/model` (same target syntax as a prefixed model).
-    /// The parsed buffer is kept alive on the server; alias model strings point into it.
+    /// The parsed buffer is kept alive on the server; alias model strings point into it. Keys are
+    /// copied, because the map frees its keys on deinit and would otherwise be freeing pointers
+    /// from inside that buffer.
     fn loadAliases(self: *Server, path: []const u8) !void {
         const file = if (std.fs.path.isAbsolute(path))
             try std.Io.Dir.openFileAbsolute(self.io, path, .{})
@@ -1172,7 +1294,9 @@ pub const Server = struct {
                 std.log.warn("aliases: duplicate alias '{s}', keeping first", .{alias});
                 continue;
             }
-            try self.aliases.put(alias, .{ .provider = provider, .model = model });
+            const owned_alias = try self.allocator.dupe(u8, alias);
+            errdefer self.allocator.free(owned_alias);
+            try self.aliases.put(owned_alias, .{ .provider = provider, .model = model });
             std.log.info("aliases: '{s}' -> {s}/{s}", .{ alias, target[0..slash], model });
         }
         self.aliases_content = content;
@@ -1297,14 +1421,36 @@ pub const Server = struct {
         return body[idx .. idx + value_end];
     }
 
+    /// Replace the "model" value in a JSON body with `model`.
+    ///
+    /// Whitespace tolerant on purpose. The old matcher searched for the literal `"model":"` and
+    /// returned the body unchanged if it was absent, so a client that puts a space (or a newline)
+    /// after the colon - every `json.dumps` body, and most debug/CLI payloads - silently skipped
+    /// normalisation and the alias name was forwarded verbatim (observed: backend answered
+    /// 404 "The model `glm53f.llite` does not exist"). Note extractModelFromBody already accepted
+    /// both spacings, so routing worked while the rewrite did not: routing and forwarding must use
+    /// the same notion of where the model is.
     fn normalizeModelInBody(self: *Server, body: []const u8, model: []const u8) ![]u8 {
-        const model_key = "\"model\":\"";
-        const model_start = std.mem.find(u8, body, model_key) orelse return try self.allocator.dupe(u8, body);
-        const value_start = model_start + model_key.len;
-        const value_end = std.mem.find(u8, body[value_start..], "\"") orelse return try self.allocator.dupe(u8, body);
-        const prefix = body[0..value_start];
-        const suffix = body[value_start + value_end ..];
-        return try std.mem.concat(self.allocator, u8, &.{ prefix, model, suffix });
+        const key = "\"model\"";
+        var pos: usize = 0;
+        while (pos < body.len) {
+            const k = std.mem.indexOfPos(u8, body, pos, key) orelse break;
+            const after_key = k + key.len;
+            var i = after_key;
+            while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == '\r' or body[i] == '\n')) i += 1;
+            if (i < body.len and body[i] == ':') {
+                i += 1;
+                while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == '\r' or body[i] == '\n')) i += 1;
+                if (i < body.len and body[i] == '"') {
+                    const value_start = i + 1;
+                    if (std.mem.indexOfScalarPos(u8, body, value_start, '"')) |value_end| {
+                        return try std.mem.concat(self.allocator, u8, &.{ body[0..value_start], model, body[value_end..] });
+                    }
+                }
+            }
+            pos = after_key;
+        }
+        return try self.allocator.dupe(u8, body);
     }
 
     fn callProvider(self: *Server, route: Route, body: []const u8) ![]u8 {
